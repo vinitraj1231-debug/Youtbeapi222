@@ -1,51 +1,53 @@
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import StreamingResponse
-import yt_dlp
-import asyncio
-import os
-import tempfile
+from fastapi.responses import JSONResponse
+import aiohttp
 
-app = FastAPI(title="YouTube Audio Download API")
+app = FastAPI(title="Working YouTube Audio API")
 
-YDL_OPTS = {
-    "format": "bestaudio/best",
-    "quiet": True,
-    "noplaylist": True,
-    "cookiefile": None,  # important: no cookies
-    "nocheckcertificate": True,
-    "geo_bypass": True,
-    "extractor_args": {
-        "youtube": {
-            "skip": ["dash", "hls"]
-        }
-    }
-}
+PIPED_INSTANCES = [
+    "https://piped.video",
+    "https://yewtu.be",
+    "https://yt.artemislena.eu"
+]
+
+async def fetch_from_piped(video_id: str):
+    for base in PIPED_INSTANCES:
+        try:
+            url = f"{base}/api/v1/streams/{video_id}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=20) as r:
+                    if r.status == 200:
+                        return await r.json()
+        except:
+            continue
+    return None
+
 
 @app.get("/download")
 async def download_audio(url: str = Query(...)):
-    loop = asyncio.get_event_loop()
+    if "v=" not in url:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
-    try:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        file_path = tmp.name
-        tmp.close()
+    video_id = url.split("v=")[-1].split("&")[0]
 
-        def run_ydl():
-            with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-                ydl.download([url])
+    data = await fetch_from_piped(video_id)
+    if not data:
+        raise HTTPException(status_code=500, detail="All Piped instances failed")
 
-        await loop.run_in_executor(None, run_ydl)
+    audio_streams = [
+        s for s in data.get("audioStreams", [])
+        if s.get("mimeType", "").startswith("audio")
+    ]
 
-        if not os.path.exists(file_path):
-            raise Exception("Audio file not created")
+    if not audio_streams:
+        raise HTTPException(status_code=404, detail="No audio stream found")
 
-        return StreamingResponse(
-            open(file_path, "rb"),
-            media_type="audio/mpeg",
-            headers={
-                "Content-Disposition": "attachment; filename=audio.mp3"
-            }
-        )
+    best_audio = max(audio_streams, key=lambda x: x.get("bitrate", 0))
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return JSONResponse({
+        "title": data.get("title"),
+        "duration": data.get("duration"),
+        "thumbnail": data.get("thumbnailUrl"),
+        "audio_url": best_audio.get("url"),
+        "bitrate": best_audio.get("bitrate")
+    })
